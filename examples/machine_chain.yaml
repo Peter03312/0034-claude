@@ -1,0 +1,11 @@
+# 必然横贯：孔宽 32 使相邻轨外扩矩形 x 投影重叠，同 tick 三孔搭接
+tick_length: 10
+hole_width: 32
+hole_height: 15
+paper_width: 60
+min_clearance: 8
+bridge_width: 0
+tracks:
+  - {id: 1, x: 14}
+  - {id: 2, x: 30}
+  - {id: 3, x: 46}

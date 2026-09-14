@@ -1,0 +1,11 @@
+# 机型（全部尺寸为同一整数单位）
+tick_length: 10        # 每 tick 纵向长度
+hole_width: 26         # 孔模横宽
+hole_height: 11        # 孔模纵长
+paper_width: 60        # 纸宽
+min_clearance: 8       # 同轨最小净距
+bridge_width: 2        # 安全桥宽（每边外扩其一半 = 1）
+tracks:
+  - {id: 1, x: 14}
+  - {id: 2, x: 30}
+  - {id: 3, x: 46}

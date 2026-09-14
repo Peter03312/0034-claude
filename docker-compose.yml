@@ -1,0 +1,35 @@
+# 纸卷打孔时序求解服务
+#
+#   docker compose up -d            # 仅常驻 api
+#   API_PORT=9000 docker compose up # 覆盖宿主映射端口
+#   docker compose run --rm verify # 一次性：跑 pytest + 启动探测
+#
+# verify 挂在 verify profile 下，不会随 `up` 常驻。
+
+services:
+  api:
+    build: .
+    image: paper-roll-punch-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  verify:
+    image: paper-roll-punch-api
+    build: .
+    profiles: ["verify"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        echo "==> pytest"
+        python -m pytest -q
+        echo "==> 启动探测（容器内自起 uvicorn 并轮询 /health）"
+        python scripts/startup_probe.py
+        echo "==> verify 完成"

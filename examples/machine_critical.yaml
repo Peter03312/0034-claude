@@ -1,0 +1,10 @@
+# 临界净距：孔高 12，|Δtick|=2 时净距恰好 8，相切合法
+tick_length: 10
+hole_width: 26
+hole_height: 12
+paper_width: 60
+min_clearance: 8
+bridge_width: 0
+tracks:
+  - {id: 1, x: 14}
+  - {id: 2, x: 30}
