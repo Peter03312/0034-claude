@@ -106,11 +106,32 @@ def _as_int(value, name: str, errors: list[str]) -> int | None:
     return value
 
 
+class _StrictSafeLoader(yaml.SafeLoader):
+    """SafeLoader 变体：映射中出现重复键时报错，而不是静默以后值覆盖。"""
+
+
+def _construct_mapping(loader: yaml.SafeLoader, node, deep: bool = False) -> dict:
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                None, None, f"YAML 映射存在重复键 {key!r}", key_node.start_mark
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_StrictSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping
+)
+
+
 def load_machine(yaml_text: str) -> Machine:
     """解析并校验机型 YAML。所有错误聚齐后一次性抛出。"""
     errors: list[str] = []
     try:
-        data = yaml.safe_load(yaml_text)
+        data = yaml.load(yaml_text, Loader=_StrictSafeLoader)  # noqa: S506 自定义严格加载器
     except yaml.YAMLError as exc:
         raise InputError([f"机型 YAML 解析失败: {exc}"]) from exc
     if not isinstance(data, dict):
@@ -232,49 +253,80 @@ def load_notes(csv_text: str, machine: Machine) -> list[Note]:
     """解析逐音符 CSV 并对照机型校验，错误聚齐后整单拒绝。"""
     errors: list[str] = []
     notes: list[Note] = []
-    reader = csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff")))
-    if reader.fieldnames is None:
+
+    rows = list(csv.reader(io.StringIO(csv_text.lstrip("\ufeff"))))
+    if not rows or not any(cell.strip() for cell in rows[0]):
         raise InputError(["CSV 为空或缺少表头"])
-    header = [h.strip() for h in reader.fieldnames]
+
+    header = [h.strip() for h in rows[0]]
     missing = [c for c in REQUIRED_COLUMNS if c not in header]
     if missing:
         raise InputError([f"CSV 表头缺少列: {', '.join(missing)}"])
 
+    # 重复表头会让按列名取值时静默丢列，显式拒绝
+    seen_headers: set[str] = set()
+    for h in header:
+        if h in seen_headers:
+            raise InputError([f"CSV 表头存在重复列 {h!r}"])
+        seen_headers.add(h)
+
+    n_cols = len(header)
     seen_ids: set[int] = set()
 
-    def row_int(row: dict[str, str], key: str, lineno: int) -> int | None:
-        raw = (row.get(key) or "").strip()
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            errors.append(f"CSV 第 {lineno} 行 {key}={raw!r} 不是整数")
-            return None
-        return value
+    for lineno, raw in enumerate(rows[1:], start=2):
+        if len(raw) == 0:
+            continue  # 物理空行
 
-    for i, row in enumerate(reader, start=2):
-        if not any((v or "").strip() for v in row.values()):
-            continue  # 跳过空行
-        note_id = row_int(row, "id", i)
-        track = row_int(row, "track", i)
-        tick = row_int(row, "tick", i)
-        before = row_int(row, "before", i)
-        after = row_int(row, "after", i)
-        chord_raw = (row.get("chord") or "").strip()
+        if len(raw) > n_cols:
+            errors.append(
+                f"CSV 第 {lineno} 行有 {len(raw)} 列，超过表头的 {n_cols} 列，"
+                f"多余内容: {raw[n_cols:]!r}"
+            )
+            continue
+        if len(raw) < n_cols:
+            errors.append(
+                f"CSV 第 {lineno} 行只有 {len(raw)} 列，少于表头的 {n_cols} 列"
+            )
+            continue
+
+        if not any(cell.strip() for cell in raw):
+            continue  # 列数相符的全空记录，视同空行
+
+        row = dict(zip(header, (cell.strip() for cell in raw)))
+
+        def row_int(key: str) -> int | None:
+            value_text = row[key]
+            try:
+                return int(value_text)
+            except ValueError:
+                errors.append(
+                    f"CSV 第 {lineno} 行 {key}={value_text!r} 不是整数"
+                )
+                return None
+
+        note_id = row_int("id")
+        track = row_int("track")
+        tick = row_int("tick")
+        before = row_int("before")
+        after = row_int("after")
+        chord_raw = row["chord"]
         chord = chord_raw if chord_raw else None
 
         if note_id is not None and note_id in seen_ids:
-            errors.append(f"CSV 第 {i} 行编号 {note_id} 重复")
+            errors.append(f"CSV 第 {lineno} 行编号 {note_id} 重复")
         if note_id is not None:
             seen_ids.add(note_id)
         if before is not None and before < 0:
-            errors.append(f"CSV 第 {i} 行 before 不得为负")
+            errors.append(f"CSV 第 {lineno} 行 before 不得为负")
         if after is not None and after < 0:
-            errors.append(f"CSV 第 {i} 行 after 不得为负")
+            errors.append(f"CSV 第 {lineno} 行 after 不得为负")
         if track is not None and track not in machine.tracks:
-            errors.append(f"CSV 第 {i} 行轨道 {track} 未在机型中定义")
+            errors.append(f"CSV 第 {lineno} 行轨道 {track} 未在机型中定义")
         if None in (note_id, track, tick, before, after):
             continue
-        notes.append(Note(note_id, track, tick, before, after, chord))  # type: ignore[arg-type]
+        notes.append(
+            Note(note_id, track, tick, before, after, chord)  # type: ignore[arg-type]
+        )
 
     if not notes and not errors:
         errors.append("CSV 没有任何音符行")
@@ -282,3 +334,4 @@ def load_notes(csv_text: str, machine: Machine) -> list[Note]:
     if errors:
         raise InputError(errors)
     return notes
+

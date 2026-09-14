@@ -130,6 +130,19 @@ async def input_error_handler(_request, exc: InputError):
     )
 
 
+@app.exception_handler(ValueError)
+async def value_error_handler(_request, exc: ValueError):
+    """装配层漏网的非法输入：报 422 而不是 500（求解器自身不抛 ValueError）。"""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "status": "invalid_input",
+            "message": "输入不合法，整单拒绝（未执行求解）",
+            "errors": [str(exc)],
+        },
+    )
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
