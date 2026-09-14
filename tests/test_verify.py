@@ -11,6 +11,8 @@
 """
 
 import json
+import threading
+import time
 
 from conftest import (
     MACHINE_CHAIN,
@@ -282,6 +284,137 @@ def test_non_integer_like_key_treated_as_extra(client):
     )
     assert resp.status_code == 422
     assert any("没有的编号" in e for e in resp.json()["errors"])
+
+
+def test_extremely_long_integer_is_aggregated_with_other_field_errors(client):
+    """超过 Python 整数转换上限（4300 位）的整数字面量不得中断整单解析：
+
+    它只作为该编号的“非整数”错误，与其他字段错误一次性聚齐，且错误来自
+    复核入口（措辞为未执行复核），不会误报成求解入口失败。
+    """
+    huge = "9" * 5000
+    # 编号 2 为超长整数（裸数字面量）；编号 3 非整数；缺编号 4；多编号 9
+    raw = '{"1": 0, "2": %s, "3": "x", "9": 0}' % huge
+    resp = post_verify(client, MACHINE_GREEDY, NOTES_GREEDY, raw)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert "复核" in body["message"]
+    errors = body["errors"]
+    assert any("编号 2" in e and "整数" in e and "5000" in e for e in errors)
+    assert any("编号 3" in e for e in errors)
+    assert any("缺少编号 4" in e for e in errors)
+    assert any("没有的编号" in e and "9" in e for e in errors)
+    # 错误消息里不得内联巨型整数（避免触发字符串化限制或刷屏）
+    assert all(huge not in e for e in errors)
+
+
+def test_negative_extremely_long_integer_rejected(client):
+    huge = "-" + "1" * 5000
+    raw = json.dumps({"1": 0, "2": huge, "3": 0, "4": 2})
+    resp = post_verify(client, MACHINE_GREEDY, NOTES_GREEDY, raw)
+    assert resp.status_code == 422
+    errors = resp.json()["errors"]
+    assert any("编号 2" in e and "整数" in e for e in errors)
+
+
+def test_exponent_float_is_rejected_not_accepted(client):
+    # 1e999 是浮点 inf：不得被当成整数位移接受
+    resp = post_verify(
+        client, MACHINE_GREEDY, NOTES_GREEDY,
+        '{"1": 1e999, "2": 2, "3": 0, "4": 2}',
+    )
+    assert resp.status_code == 422
+    assert any("编号 1" in e and "整数" in e for e in resp.json()["errors"])
+
+
+# ---------------------------------------------------------------------------
+# 复核不得阻塞事件循环
+# ---------------------------------------------------------------------------
+
+DENSE_MACHINE = """
+tick_length: 10
+hole_width: 10
+hole_height: 11
+paper_width: 60
+min_clearance: 8
+bridge_width: 0
+tracks:
+  - {id: 1, x: 30}
+"""
+
+DENSE_SMALL_NOTES = "id,track,tick,before,after,chord\n1,1,5,0,0,\n"
+
+
+def test_dense_verification_does_not_block_health(client):
+    """密集候选的复核在工作线程执行：复核进行中 /health 必须即时响应。"""
+    n_notes = 5000
+    notes = "id,track,tick,before,after,chord\n" + "".join(
+        f"{i},1,{i},0,0,\n" for i in range(1, n_notes + 1)
+    )
+    displacements = json.dumps({str(i): 0 for i in range(1, n_notes + 1)})
+
+    box = {}
+
+    def run_verify():
+        box["start"] = time.monotonic()
+        box["resp"] = post_verify(
+            client, DENSE_MACHINE, notes, displacements
+        )
+
+    worker = threading.Thread(target=run_verify)
+    worker.start()
+    try:
+        # 等复核判定确实在跑（仍在工作线程中），再探活
+        deadline = time.monotonic() + 5.0
+        while "start" not in box and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert worker.is_alive(), "复核过快结束，无法验证并发探活"
+
+        t0 = time.monotonic()
+        health = client.get("/health")
+        latency = time.monotonic() - t0
+        assert health.status_code == 200
+        # 事件循环被占住时这里会等到复核结束（数秒），而不是毫秒级返回
+        assert latency < 0.5, f"复核期间 /health 被阻塞 {latency:.2f}s"
+
+        # 其他轻量请求同样不被阻塞
+        t0 = time.monotonic()
+        other = post_solve(client, DENSE_MACHINE, DENSE_SMALL_NOTES)
+        latency = time.monotonic() - t0
+        assert other.status_code == 200
+        assert latency < 2.0, f"复核期间其他请求被阻塞 {latency:.2f}s"
+    finally:
+        worker.join(timeout=60)
+
+    assert box["resp"].status_code == 200
+    assert box["resp"].json()["status"] == "unsafe_clearance"
+
+
+def test_concurrent_verifications_all_complete(client):
+    """多个密集复核并发提交：工作线程池并行处理，全部得到一致结论。"""
+    n_notes = 800
+    notes = "id,track,tick,before,after,chord\n" + "".join(
+        f"{i},1,{i},0,0,\n" for i in range(1, n_notes + 1)
+    )
+    displacements = json.dumps({str(i): 0 for i in range(1, n_notes + 1)})
+    results: list = []
+    errors: list = []
+
+    def worker():
+        try:
+            results.append(
+                post_verify(client, DENSE_MACHINE, notes, displacements).json()["status"]
+            )
+        except Exception as exc:  # pragma: no cover - 仅用于暴露并发失败
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not errors
+    assert results == ["unsafe_clearance"] * 8
 
 
 # ---------------------------------------------------------------------------

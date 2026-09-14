@@ -34,6 +34,30 @@ class _DuplicateKeyError(ValueError):
     """候选 JSON 映射存在重复键（携带该键）。"""
 
 
+class _OversizedInt:
+    """超过 Python 整数转换上限的整数字面量占位值。
+
+    Python 3.11+ 的 json 对超过 4300 位的整数会在解析期抛裸 ValueError，
+    导致整单中断。parse_int 钩子里捕获后以本占位返回，让其作为该字段
+    的“非整数”错误与其余字段错误一次性聚齐。
+    """
+
+    __slots__ = ("digits",)
+
+    def __init__(self, digits: int):
+        self.digits = digits
+
+    def __repr__(self) -> str:
+        return f"<{self.digits} 位整数>"
+
+
+def _parse_int(token: str):
+    try:
+        return int(token, 10)
+    except ValueError:
+        return _OversizedInt(len(token.lstrip("-+")))
+
+
 def _reject_duplicate_keys(pairs: list[tuple]) -> dict:
     """json.loads 的 object_pairs_hook：映射内重复键直接报错。"""
     result: dict = {}
@@ -42,6 +66,14 @@ def _reject_duplicate_keys(pairs: list[tuple]) -> dict:
             raise _DuplicateKeyError(key)
         result[key] = value
     return result
+
+
+def _short_repr(value, limit: int = 32) -> str:
+    """错误消息中的值表示：截断超长内容，且不触发大整数字符串化限制。"""
+    if isinstance(value, _OversizedInt):
+        return repr(value)
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def assemble_candidates(
@@ -58,10 +90,19 @@ def assemble_candidates(
         raise InputError(["候选 displacements 缺失或为空"], stage="verify")
 
     try:
-        data = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+        data = json.loads(
+            raw,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_int=_parse_int,
+        )
     except _DuplicateKeyError as exc:
         raise InputError(
             [f"候选 displacements JSON 存在重复键 {exc.args[0]!r}"], stage="verify"
+        ) from exc
+    except ValueError as exc:
+        # parse_int 已吸收超大整数；此处兜住其余解析期 ValueError
+        raise InputError(
+            [f"候选 displacements 不是合法 JSON: {exc}"], stage="verify"
         ) from exc
     except json.JSONDecodeError as exc:
         raise InputError(
@@ -91,19 +132,24 @@ def assemble_candidates(
             # 无法规范成音符编号或清单中不存在：一律按多号处理（含 "1.0"、true）
             errors.append((
                 (1, nid if canonical else 10**18, str(key)),
-                f"候选出现音符清单中没有的编号 {key!r}",
+                f"候选出现音符清单中没有的编号 {_short_repr(key)}",
             ))
             continue
-        if isinstance(value, bool) or not isinstance(value, int):
-            errors.append(((0, nid, ""), f"编号 {nid} 的位移必须是整数，得到 {value!r}"))
+        if isinstance(value, _OversizedInt) or isinstance(value, bool) \
+                or not isinstance(value, int):
+            errors.append((
+                (0, nid, ""),
+                f"编号 {nid} 的位移必须是整数，得到 {_short_repr(value)}",
+            ))
             invalid_ids.add(nid)
             continue
         note = note_by_id[nid]
         lo, hi = -note.before, note.after
         if not lo <= value <= hi:
+            shown = value if abs(value) < 10**12 else _short_repr(value)
             errors.append((
                 (0, nid, ""),
-                f"编号 {nid} 的位移 {value} 超出允许域 [{lo}, {hi}]",
+                f"编号 {nid} 的位移 {shown} 超出允许域 [{lo}, {hi}]",
             ))
             invalid_ids.add(nid)
             continue

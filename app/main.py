@@ -249,19 +249,21 @@ async def solve_endpoint(
 
 
 @app.post("/verify")
-async def verify_endpoint(
+def verify_endpoint(
     machine: UploadFile = File(..., description="机型 YAML"),
     notes: UploadFile = File(..., description="逐音符 CSV"),
     displacements: str | None = Form(
         None, description="候选位移 JSON（与 /solve 返回的 displacements 同构）"
     ),
 ):
+    # 同步处理器：密集候选的复核判定可能耗时较长，由 Starlette 放入工作线程
+    # 执行，不占用事件循环——/health 与其他请求在复核期间仍可被处理。
     try:
-        machine_text = (await machine.read()).decode("utf-8")
+        machine_text = machine.file.read().decode("utf-8")
     except UnicodeDecodeError:
         raise InputError(["机型文件不是合法 UTF-8 文本"], stage="verify")
     try:
-        notes_text = (await notes.read()).decode("utf-8")
+        notes_text = notes.file.read().decode("utf-8")
     except UnicodeDecodeError:
         raise InputError(["音符 CSV 不是合法 UTF-8 文本"], stage="verify")
 
