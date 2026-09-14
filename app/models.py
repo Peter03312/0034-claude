@@ -20,10 +20,15 @@ import yaml
 
 
 class InputError(ValueError):
-    """输入装配错误：messages 收集所有错误，整单拒绝时一次性返回。"""
+    """输入装配错误：messages 收集所有错误，整单拒绝时一次性返回。
 
-    def __init__(self, messages: list[str]):
+    stage 标记出错入口（"solve" / "verify"），供异常处理器给出
+    与入口一致的拒绝说明；缺省沿用 /solve 的措辞。
+    """
+
+    def __init__(self, messages: list[str], stage: str | None = None):
         self.messages = messages
+        self.stage = stage
         super().__init__("; ".join(messages))
 
 

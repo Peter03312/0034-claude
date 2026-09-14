@@ -143,3 +143,22 @@ def post_solve(client, yaml_text: str, csv_text: str):
             "notes": ("notes.csv", csv_text, "text/csv"),
         },
     )
+
+
+def post_verify(client, yaml_text: str, csv_text: str, displacements):
+    """POST /verify；displacements 为 dict（内部 json.dumps）或原始字符串。"""
+    import json
+
+    raw = (
+        displacements
+        if isinstance(displacements, str)
+        else json.dumps(displacements)
+    )
+    return client.post(
+        "/verify",
+        files={
+            "machine": ("machine.yaml", yaml_text, "application/x-yaml"),
+            "notes": ("notes.csv", csv_text, "text/csv"),
+        },
+        data={"displacements": raw},
+    )

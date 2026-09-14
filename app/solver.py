@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
+from typing import Sequence
 
 from .models import Machine, Note
 
@@ -39,6 +40,48 @@ LEFT = -1   # 虚拟节点：左纸边
 RIGHT = -2  # 虚拟节点：右纸边
 
 sys.setrecursionlimit(10000)
+
+
+# ---------------------------------------------------------------------------
+# 组模型（求解与复核共用的公共判定）
+# ---------------------------------------------------------------------------
+
+def build_groups(
+    notes: list[Note],
+) -> tuple[list[Note], list["Group"]]:
+    """从音符清单构造组模型并回填每个音符的 group_index。
+
+    同 chord 的音符共享一组（允许域取交集），chord 为空者各自成组；
+    组按组内最小音符编号升序排列，音符按编号升序返回。
+    """
+    ordered = sorted(notes, key=lambda n: n.note_id)
+
+    chord_map: dict[str, list[int]] = {}
+    solo: list[int] = []
+    for i, note in enumerate(ordered):
+        if note.chord is None:
+            solo.append(i)
+        else:
+            chord_map.setdefault(note.chord, []).append(i)
+
+    groups: list[Group] = []
+    for i in solo:
+        n = ordered[i]
+        groups.append(Group(len(groups), None, [i], -n.before, n.after))
+    for chord, members in chord_map.items():
+        members.sort(key=lambda i: ordered[i].note_id)
+        lo = max(-ordered[i].before for i in members)
+        hi = min(ordered[i].after for i in members)
+        groups.append(Group(len(groups), chord, members, lo, hi))
+
+    # 组序按组内最小编号升序：按编号升序的音符位移向量与组序向量
+    # 的字典序完全一致（组内位移相同，首编号互不相同）。
+    groups.sort(key=lambda grp: min(ordered[i].note_id for i in grp.member_ids))
+    for new_idx, grp in enumerate(groups):
+        grp.index = new_idx
+        for i in grp.member_ids:
+            ordered[i].group_index = new_idx
+    return ordered, groups
 
 
 # ---------------------------------------------------------------------------
@@ -126,14 +169,12 @@ class SolveResult:
 class Solver:
     def __init__(self, machine: Machine, notes: list[Note]):
         self.m = machine
-        self.notes = sorted(notes, key=lambda n: n.note_id)
+        self.notes, self.groups = build_groups(notes)
         self.n = len(self.notes)
         self.track_of = [n.track for n in self.notes]
         self.by_track: dict[int, list[int]] = {}
         for i, n in enumerate(self.notes):
             self.by_track.setdefault(n.track, []).append(i)
-
-        self.groups = self._build_groups()
         self.g = len(self.groups)
 
         # 搜索工作区
@@ -163,35 +204,7 @@ class Solver:
         self.diag_best_max = 0
         self.diag_best_sum = 0
 
-    # ------------------------------------------------------------------ 组
-    def _build_groups(self) -> list[Group]:
-        chord_map: dict[str, list[int]] = {}
-        solo: list[int] = []
-        for i, note in enumerate(self.notes):
-            if note.chord is None:
-                solo.append(i)
-            else:
-                chord_map.setdefault(note.chord, []).append(i)
-
-        groups: list[Group] = []
-        for i in solo:
-            n = self.notes[i]
-            groups.append(Group(len(groups), None, [i], -n.before, n.after))
-        for chord, members in chord_map.items():
-            members.sort(key=lambda i: self.notes[i].note_id)
-            lo = max(-self.notes[i].before for i in members)
-            hi = min(self.notes[i].after for i in members)
-            groups.append(Group(len(groups), chord, members, lo, hi))
-
-        # 组序按组内最小编号升序：按编号升序的音符位移向量与组序向量
-        # 的字典序完全一致（组内位移相同，首编号互不相同）。
-        groups.sort(key=lambda grp: min(self.notes[i].note_id for i in grp.member_ids))
-        for new_idx, grp in enumerate(groups):
-            grp.index = new_idx
-            for i in grp.member_ids:
-                self.notes[i].group_index = new_idx
-        return groups
-
+    # ------------------------------------------------------------- 候选
     def _candidates(self, grp: Group, cap: int) -> list[int]:
         """组在 |d|<=cap 下的候选位移，按目标偏好序：0, -1, +1, -2, +2..."""
         lo = max(grp.lo, -cap)
@@ -422,69 +435,7 @@ class Solver:
 
     # ------------------------------------------------- 最小贯通链
     def _smallest_chain(self, assignment: list[int]) -> list[int] | None:
-        """在给定位移向量上，求孔编号序列字典序最小的真实左右贯通链。
-
-        图节点为孔，外扩矩形接触/重叠连边；完整 DFS，按邻居编号升序枚举，
-        用已知最优同长度前缀做安全剪枝。
-        """
-        rects: dict[int, tuple[int, int, int, int]] = {}
-        for i, n in enumerate(self.notes):
-            rects[i] = self.m.expanded_rect(n.track, n.tick + assignment[n.group_index])
-
-        ids = list(rects)
-        adj: dict[int, list[int]] = {i: [] for i in ids}
-        for ai in range(len(ids)):
-            i = ids[ai]
-            ri = rects[i]
-            for j in ids[ai + 1:]:
-                rj = rects[j]
-                if (
-                    ri[0] <= rj[2] and rj[0] <= ri[2]
-                    and ri[1] <= rj[3] and rj[1] <= ri[3]
-                ):
-                    adj[i].append(j)
-                    adj[j].append(i)
-        for i in adj:
-            adj[i].sort(key=lambda x: self.notes[x].note_id)
-
-        left_nodes = sorted(
-            (i for i, r in rects.items() if self.m.touches_left_edge(r)),
-            key=lambda i: self.notes[i].note_id,
-        )
-        right_set = {i for i, r in rects.items() if self.m.touches_right_edge(r)}
-
-        best: list[int] | None = None
-
-        def dfs(path: list[int], visited: set[int]) -> None:
-            nonlocal best
-            last = path[-1]
-            if last in right_set:
-                if best is None or self._seq(path) < self._seq(best):
-                    best = list(path)
-                return
-            for nb in adj[last]:
-                if nb in visited:
-                    continue
-                if best is not None:
-                    trial = self._seq(path) + [self.notes[nb].note_id]
-                    bseq = self._seq(best)
-                    L = min(len(trial), len(bseq))
-                    if trial[:L] > bseq[:L]:
-                        continue
-                visited.add(nb)
-                path.append(nb)
-                dfs(path, visited)
-                path.pop()
-                visited.remove(nb)
-
-        for start in left_nodes:
-            if best is not None and self.notes[start].note_id > self._seq(best)[0]:
-                break
-            dfs([start], {start})
-
-        if best is None:
-            return None
-        return self._seq(best)
+        return find_smallest_chain(self.m, self.notes, assignment)
 
     def _seq(self, path: list[int]) -> list[int]:
         return [self.notes[i].note_id for i in path]
@@ -527,6 +478,83 @@ class Solver:
             disp_b=vals[self.notes[ib].group_index],
             gap=gap,
         )
+
+
+def find_smallest_chain(
+    machine: Machine,
+    notes: Sequence[Note],
+    group_values: Sequence[int],
+) -> list[int] | None:
+    """在给定位移向量上，求孔编号序列字典序最小的真实左右贯通链。
+
+    notes 需按编号升序排列（即 build_groups 的返回顺序），group_values[g]
+    为第 g 组的位移。图节点为孔，外扩矩形接触/重叠连边；完整 DFS，按邻居
+    编号升序枚举，用已知最优同长度前缀做安全剪枝。复核层直接复用此判定。
+    """
+    rects: dict[int, tuple[int, int, int, int]] = {}
+    for i, n in enumerate(notes):
+        rects[i] = machine.expanded_rect(
+            n.track, n.tick + group_values[n.group_index]
+        )
+
+    ids = list(rects)
+    adj: dict[int, list[int]] = {i: [] for i in ids}
+    for ai in range(len(ids)):
+        i = ids[ai]
+        ri = rects[i]
+        for j in ids[ai + 1:]:
+            rj = rects[j]
+            if (
+                ri[0] <= rj[2] and rj[0] <= ri[2]
+                and ri[1] <= rj[3] and rj[1] <= ri[3]
+            ):
+                adj[i].append(j)
+                adj[j].append(i)
+    # notes 已按编号升序，建边追加即为升序；稳妥起见再排序。
+    for i in adj:
+        adj[i].sort(key=lambda x: notes[x].note_id)
+
+    left_nodes = sorted(
+        (i for i, r in rects.items() if machine.touches_left_edge(r)),
+        key=lambda i: notes[i].note_id,
+    )
+    right_set = {i for i, r in rects.items() if machine.touches_right_edge(r)}
+
+    def seq(path: list[int]) -> list[int]:
+        return [notes[i].note_id for i in path]
+
+    best: list[int] | None = None
+
+    def dfs(path: list[int], visited: set[int]) -> None:
+        nonlocal best
+        last = path[-1]
+        if last in right_set:
+            if best is None or seq(path) < seq(best):
+                best = list(path)
+            return
+        for nb in adj[last]:
+            if nb in visited:
+                continue
+            if best is not None:
+                trial = seq(path) + [notes[nb].note_id]
+                bseq = seq(best)
+                length = min(len(trial), len(bseq))
+                if trial[:length] > bseq[:length]:
+                    continue
+            visited.add(nb)
+            path.append(nb)
+            dfs(path, visited)
+            path.pop()
+            visited.remove(nb)
+
+    for start in left_nodes:
+        if best is not None and notes[start].note_id > seq(best)[0]:
+            break
+        dfs([start], {start})
+
+    if best is None:
+        return None
+    return seq(best)
 
 
 def solve(machine: Machine, notes: list[Note]) -> SolveResult:

@@ -3,15 +3,21 @@
 POST /solve  multipart 上传：
   machine: 机型 YAML 文件
   notes:   逐音符 CSV 文件
+
+POST /verify multipart 上传：
+  machine:       机型 YAML 文件
+  notes:         逐音符 CSV 文件
+  displacements: 候选位移 JSON（与 /solve 返回的 displacements 同构）
 """
 
 from __future__ import annotations
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 
 from .models import InputError, Machine, load_machine, load_notes
-from .solver import SolveResult, solve
+from .solver import SolveResult, build_groups, solve
+from .verifier import VerifyResult, assemble_candidates, verify
 
 app = FastAPI(
     title="纸卷打孔时序求解 API",
@@ -118,13 +124,83 @@ def _result_payload(machine: Machine, notes, result: SolveResult) -> dict:
     }
 
 
+def _verify_payload(machine: Machine, notes, result: VerifyResult) -> dict:
+    note_by_id = {n.note_id: n for n in notes}
+
+    def hole_item(nid: int) -> dict:
+        d = result.displacements[nid]
+        note = note_by_id[nid]
+        item = {"id": nid, "displacement": d}
+        item.update(_hole_payload(machine, note.track, note.tick + d))
+        return item
+
+    if result.verified:
+        holes = [hole_item(nid) for nid in sorted(result.displacements)]
+        return {
+            "status": "verified",
+            "objective": {
+                "max_abs_displacement": result.max_abs,
+                "total_abs_displacement": result.total_abs,
+            },
+            "displacements": result.displacements,
+            "chord_displacements": result.chord_displacements,
+            "holes": holes,
+        }
+
+    if result.conflict is not None:
+        c = result.conflict
+        return {
+            "status": "unsafe_clearance",
+            "reason": "candidate_fails_same_track_clearance",
+            "message": (
+                f"候选位移未通过同轨净距复核；编号对最小的实际冲突："
+                f"孔 {c.id_a} 与 {c.id_b}（轨道 {c.track}），"
+                f"调整后 tick {c.tick_a}/{c.tick_b}，净距 {c.gap}"
+            ),
+            "displacements": result.displacements,
+            "conflict": {
+                "id_a": c.id_a,
+                "id_b": c.id_b,
+                "track": c.track,
+                "adjusted_tick_a": c.tick_a,
+                "adjusted_tick_b": c.tick_b,
+                "displacement_a": c.disp_a,
+                "displacement_b": c.disp_b,
+                "gap": c.gap,
+                "required_min_clearance": machine.min_clearance,
+            },
+        }
+
+    assert result.chain is not None
+    holes = [hole_item(nid) for nid in result.chain]
+    return {
+        "status": "unsafe_chain",
+        "reason": "candidate_forms_left_right_weak_chain",
+        "message": (
+            "候选位移通过同轨净距，但外扩矩形形成横贯整张纸宽的薄弱链；"
+            "给出孔编号序列字典序最小的真实贯通链"
+        ),
+        "displacements": result.displacements,
+        "weak_chain": {
+            "note_ids": result.chain,
+            "sequence_description": "左纸边 -> 孔（外扩矩形接触搭接）-> 右纸边",
+            "holes": holes,
+        },
+    }
+
+
 @app.exception_handler(InputError)
 async def input_error_handler(_request, exc: InputError):
+    message = (
+        "候选复核输入不合法，整单拒绝（未执行复核）"
+        if exc.stage == "verify"
+        else "输入装配失败，整单拒绝（未执行求解）"
+    )
     return JSONResponse(
         status_code=422,
         content={
             "status": "invalid_input",
-            "message": "输入装配失败，整单拒绝（未执行求解）",
+            "message": message,
             "errors": exc.messages,
         },
     )
@@ -132,7 +208,7 @@ async def input_error_handler(_request, exc: InputError):
 
 @app.exception_handler(ValueError)
 async def value_error_handler(_request, exc: ValueError):
-    """装配层漏网的非法输入：报 422 而不是 500（求解器自身不抛 ValueError）。"""
+    """装配层漏网的非法输入：报 422 而不是 500（求解/复核层自身不抛 ValueError）。"""
     return JSONResponse(
         status_code=422,
         content={
@@ -170,3 +246,35 @@ async def solve_endpoint(
 
     result = solve(machine_model, note_models)
     return _result_payload(machine_model, note_models, result)
+
+
+@app.post("/verify")
+async def verify_endpoint(
+    machine: UploadFile = File(..., description="机型 YAML"),
+    notes: UploadFile = File(..., description="逐音符 CSV"),
+    displacements: str | None = Form(
+        None, description="候选位移 JSON（与 /solve 返回的 displacements 同构）"
+    ),
+):
+    try:
+        machine_text = (await machine.read()).decode("utf-8")
+    except UnicodeDecodeError:
+        raise InputError(["机型文件不是合法 UTF-8 文本"], stage="verify")
+    try:
+        notes_text = (await notes.read()).decode("utf-8")
+    except UnicodeDecodeError:
+        raise InputError(["音符 CSV 不是合法 UTF-8 文本"], stage="verify")
+
+    # 机型与音符沿用 /solve 的原有聚合校验；候选字段错误在此之上聚齐
+    try:
+        machine_model = load_machine(machine_text)
+        note_models = load_notes(notes_text, machine_model)
+    except InputError as exc:
+        raise InputError(exc.messages, stage="verify") from exc
+
+    # 复核层组模型与求解器同源
+    ordered, groups = build_groups(note_models)
+    candidates = assemble_candidates(displacements, ordered, groups)
+
+    result = verify(machine_model, ordered, candidates)
+    return _verify_payload(machine_model, ordered, result)

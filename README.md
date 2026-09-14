@@ -153,13 +153,60 @@ python -m pytest -q
  "errors": ["...", "..."]}
 ```
 
+### `POST /verify`
+
+开机前对人工校正或从工单恢复的**候选位移表**做复核：只判定候选值，
+**不重新搜索**。`multipart/form-data`：
+
+- `machine`：机型 YAML 文件（与 `/solve` 相同，沿用原有聚合校验）
+- `notes`：逐音符 CSV 文件（同上）
+- `displacements`：候选位移 JSON 字符串，结构与 `/solve` 返回的
+  `displacements` 完全一致：`{"1": 0, "2": 2, ...}`
+
+候选先做字段校验（缺号、多号、非整数、越界 `[-before, after]`、
+同和弦成员不一致、重复 JSON 键），错误按编号稳定汇总为 `422
+invalid_input`，**不执行几何判定**——不完整候选属于输入错误，不会被
+误判成不可打孔。字段齐全后，复核层复用求解器的组模型与放大 2 倍整数
+几何，依次检查**同轨净距**与**外扩矩形横贯**：
+
+**通过**（`200`）：`status = "verified"`，携带目标值
+（`max_abs_displacement` / `total_abs_displacement`）、`displacements`、
+`chord_displacements` 与逐孔 `holes`（几何口径与 `/solve` 完全一致）。
+
+**净距危险**（`200`）：
+
+```json
+{
+  "status": "unsafe_clearance",
+  "reason": "candidate_fails_same_track_clearance",
+  "displacements": {"1": 0, "2": 0, "3": 0, "4": 0},
+  "conflict": {
+    "id_a": 2, "id_b": 3, "track": 2,
+    "adjusted_tick_a": 8, "adjusted_tick_b": 7,
+    "displacement_a": 0, "displacement_b": 0,
+    "gap": -2, "required_min_clearance": 8
+  }
+}
+```
+
+冲突为同轨全部孔对中**编号对最小**的实际冲突（双方编号、轨道、
+调整后 tick、位移、实测净距）。
+
+**横贯危险**（`200`）：`status = "unsafe_chain"`，
+`weak_chain.note_ids` 为候选向量上孔编号序列**字典序最小的真实贯通链**
+（首孔触左边、末孔触右边、相邻孔外扩矩形真实接触），并携带对应位移与
+逐孔矩形。同一输入重复复核结果一致。
+
 ## 项目结构
 
 ```
 app/
-  models.py   # YAML/CSV 输入装配、机型与孔区几何（放大 2 倍整数运算）
-  solver.py   # 组模型、回滚并查集、增量净距/连通剪枝、完整搜索与诊断
-  main.py     # FastAPI 路由与响应装配
+  models.py    # YAML/CSV 输入装配、机型与孔区几何（放大 2 倍整数运算）
+  solver.py    # 组模型 build_groups、回滚并查集、增量净距/连通剪枝、
+               # 完整搜索与诊断；find_smallest_chain 为求解/复核共用判定
+  verifier.py  # 候选字段校验（缺号/多号/非整数/越界/同和弦）与只判定
+               # 不搜索的 verify（先同轨净距，后外扩矩形横贯）
+  main.py      # FastAPI 路由与响应装配（/solve、/verify）
 scripts/
   startup_probe.py   # verify 服务使用的一次性启动探测
 tests/
@@ -168,6 +215,7 @@ tests/
   test_chain.py         # 必然贯通与真实链
   test_tie.py           # 稳定并列（字典序 + 重复确定性 + 行序无关）
   test_bad_input.py     # 坏输入整单拒绝、错误聚齐
+  test_verify.py        # 求解结果原样复核 / 净距取证 / 横贯取证 / 字段错误
   test_bruteforce.py    # 随机实例与独立朴素穷举逐一对照
 ```
 
